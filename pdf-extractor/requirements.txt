@@ -1,0 +1,17 @@
+# Core
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+
+# PDF extraction
+PyMuPDF
+pdfplumber
+
+# Image upload
+cloudinary
+
+# OCR (optional — needed for browser-printed PDFs)
+pytesseract
+Pillow
