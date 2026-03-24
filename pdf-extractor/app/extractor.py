@@ -967,17 +967,17 @@ class UnifiedReportExtractor:
 
         # Difference: "is 17% ... UNDER NORM" (text may have words between % and UNDER)
         for pat in [
-            r"difference\b[^0-9]*?is\s+([\d.]+)\s*%[\s\S]{0,80}?(UNDER|OVER)\s+NORM",
-            r"(\d+)\s*%[\s\S]{0,80}?(UNDER|OVER)\s+NORM",
+            r"difference\b[^0-9]*?is\s*([\d,.]+)\s*%[\s\S]{0,100}?(UNDER|OVER)\s+NORM",
+            r"([\d,.]+)\s*%[\s\S]{0,100}?(UNDER|OVER)\s+NORM",
             r"is\s+(UNDER|OVER)\s+NORM",
         ]:
             m = re.search(pat, text, re.I)
             if m:
                 grps = m.groups()
-                if len(grps) >= 2 and grps[0].replace(".", "").isdigit():
-                    pct = _float(grps[0])
-                    if pct is not None:
-                        sc["difference_percent"] = pct
+                if len(grps) >= 2:
+                    pct_val = grps[0].replace(",", "")
+                    if pct_val.replace(".", "").isdigit():
+                        sc["difference_percent"] = float(pct_val)
                 typ = grps[-1].strip().upper() + " NORM"
                 sc["difference_type"] = typ
                 break
@@ -998,29 +998,28 @@ class UnifiedReportExtractor:
             if v is not None:
                 sc["planned_plants"] = v
 
-        # Fallback: look for large numbers BEFORE "Recommended" label
-        # In Stand Count charts, the data numbers appear above the labels
+        # Fallback: look for large numbers near "Recommended" or at bottom of text
+        # In Stand Count charts, the data numbers often appear far from labels
         if sc["planned_plants"] is None:
-            m_rec = re.search(r"Recommended", text, re.I)
-            if m_rec:
-                # Search in the text BEFORE "Recommended" for large numbers
-                before_text = text[:m_rec.start()]
-                # Find all large numbers (> 100,000) before "Recommended"
-                large_nums = []
-                for num_m in re.finditer(r"([\d,]{5,})", before_text):
-                    v = _int(num_m.group(1))
-                    if v is not None and v > 100000:
-                        large_nums.append(v)
-                # The planned/recommended plants is typically the LARGEST number
-                # (it's bigger than counted since counted is UNDER NORM)
-                if large_nums:
-                    sc["planned_plants"] = max(large_nums)
+            # Find all large numbers (> 10,000)
+            large_nums = []
+            for num_m in re.finditer(r"([\d,]{5,})", text):
+                v = _int(num_m.group(1))
+                if v is not None and v > 10000:
+                    large_nums.append(v)
+            
+            # If we have multiple, the planned/recommended is typically the largest 
+            # (bigger than counted if UNDER NORM, or middle if within norm)
+            if large_nums:
+                # Often the planned value is the max in the list of counts
+                # especially if counted is 1.4M and planned is 1.6M
+                sc["planned_plants"] = max(large_nums)
 
         # Compute difference_percent from planned vs counted if not in text
         planned = sc["planned_plants"]
         counted = sc["plants_counted"]
         if sc["difference_percent"] is None and planned and counted and planned > 0:
-            sc["difference_percent"] = round(((planned - counted) / planned) * 100, 1)
+            sc["difference_percent"] = round(abs(planned - counted) / planned * 100, 1)
 
     # ── Additional info ──────────────────────────────────────────────────
 
@@ -1054,10 +1053,8 @@ class UnifiedReportExtractor:
                 if info:
                     self.result["additional_info"] = info
                     return
-                # If we matched but result is None (e.g. placeholder), stop here
-                # to prevent greedy fallbacks from capturing tables
-                self.result["additional_info"] = None
-                return
+                # If it's just a placeholder, don't return yet; try subsequent fallbacks
+                break
 
         # Multi-line fallback
         m = re.search(
@@ -1068,6 +1065,19 @@ class UnifiedReportExtractor:
             info = self._clean_additional_info(m.group(1).strip())
             if info:
                 self.result["additional_info"] = info
+                return
+
+        # Bottom-of-page fallback: Look for notes between "STRESS LEVEL TABLE" and "Powered by"
+        # Often in the "Test comment" layout
+        m = re.search(r"STRESS\s+LEVEL\s+TABLE\s*.*?\n(.*?)(?=\s*Powered\s+by|$)", full_text, re.I | re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            # Clean it — but only if it doesn't look like table data
+            # Table data usually consists of level names followed by numbers
+            if not re.search(r"^(?:Not\s+waterlogged|Fine|No\s+Damage|Full\s+Flowering)\b", content, re.I):
+                info = self._clean_additional_info(content)
+                if info:
+                    self.result["additional_info"] = info
 
     # ── Totals fallback ──────────────────────────────────────────────────
 
