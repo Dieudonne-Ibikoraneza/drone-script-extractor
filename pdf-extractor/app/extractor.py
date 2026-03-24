@@ -561,11 +561,18 @@ class UnifiedReportExtractor:
                 return
 
         # Fallback: value before metadata labels (Analysis name is often above them)
-        m = re.search(r"([\w][\w\s.\-]{2,40}?)\s+(?:\d+\s+days?\s+)?Growing\s+stage\s*:", text_raw, re.I)
+        # We look for a single line [^\n] to avoid capturing multiple blocks
+        m = re.search(r"([^\n]{2,40}?)\s+(?:\d+\s+days?\s+)?Growing\s+stage\s*:", text_raw, re.I)
         if m:
-            self.result["report"]["analysis_name"] = m.group(1).strip()
-            return
+            name = m.group(1).strip()
+            if "ZONE MANAGEMENT" not in name.upper():
+                self.result["report"]["analysis_name"] = name
+                return
 
+        # Fallback: use type keyword if we found one
+        if self.report_type:
+            self.result["report"]["analysis_name"] = self.report_type.replace("_", " ").title()
+            
         # Fallback: use type keyword from the text
         if self.type_config:
             for kw in self.type_config["keywords"]:
@@ -618,6 +625,7 @@ class UnifiedReportExtractor:
             "stress", "level", "table", "potential", "waterlogged", "wet", "zone",
             "plant", "pest", "waterlogging", "analysis", "detection", "health", "fine",
             "flowering", "damage", "count", "additional", "information",
+            "management", "zone", "management",
         }
 
         def _valid_stage(s: str) -> bool:
@@ -658,7 +666,9 @@ class UnifiedReportExtractor:
             stage = m.group(1).strip()
             # If multiple words, take the last one (often the stage)
             if " " in stage:
-                stage = stage.split()[-1]
+                # But skip if it's "ZONE" or "MANAGEMENT"
+                parts = [p for p in stage.split() if p.upper() not in ("ZONE", "MANAGEMENT", "STRESS")]
+                stage = parts[-1] if parts else ""
             if _valid_stage(stage):
                 self.result["field"]["growing_stage"] = stage
                 return
@@ -1032,8 +1042,8 @@ class UnifiedReportExtractor:
 
     def _extract_additional_info(self, full_text: str, text_spaced: str) -> None:
         patterns = [
-            r"Additional\s+[Ii]nformation\s*(?:\([^)]*\))?\s*:\s*(.+?)(?=\s+(?:Powered\s+by|Analysis\s+name|STRESS\s+LEVEL\s+TABLE)|$)",
-            r"Additional\s+[Ii]nformation\s*(?:\([^)]*\))?\s*:?\s*(.+?)(?:\s+Powered|$)",
+            # Main pattern with lookahead for other sections
+            r"Additional\s+[Ii]nformation\s*(?:\([^)]*\))?\s*:?\s*(.+?)(?=\s+(?:Powered\s+by|Analysis\s+name|STRESS\s+LEVEL\s+TABLE|Stress\s+level)|$)",
             r"Recommendation\s*:\s*([^\n]+)",
             r"Note\s*:\s*([^\n]+)",
         ]
@@ -1044,6 +1054,10 @@ class UnifiedReportExtractor:
                 if info:
                     self.result["additional_info"] = info
                     return
+                # If we matched but result is None (e.g. placeholder), stop here
+                # to prevent greedy fallbacks from capturing tables
+                self.result["additional_info"] = None
+                return
 
         # Multi-line fallback
         m = re.search(
