@@ -93,8 +93,8 @@ class ReportTypeConfig:
                 {
                     "name": "Potential Plant Stress",
                     "severity": "moderate",
-                    "pattern_pct_first":  r"\bPotential\s+Plant\s+Stress\s+([\d.]+)\s*%\s+([\d.]+)\b",
-                    "pattern_area_first": r"\bPotential\s+Plant\s+Stress\s+([\d.]+)\s+([\d.]+)\s*%",
+                    "pattern_pct_first":  r"\bPotential\s+Plant\s+(?:Stress\s+)?([\d.]+)\s*%\s+([\d.]+)(?:\s*Stress)?",
+                    "pattern_area_first": r"\bPotential\s+Plant\s+(?:Stress\s+)?([\d.]+)\s+([\d.]+)\s*%(?:\s*Stress)?",
                 },
                 {
                     "name": "Plant Stress",
@@ -198,7 +198,7 @@ class ReportTypeConfig:
         },
         "pest": {
             "keywords": [
-                "PEST", "Pest", "PEST STRESS", "Pest Stress",
+                "PEST STRESS", "Pest Stress",
                 "PEST DAMAGE", "Pest Damage", "PEST ANALYSIS", "Pest Analysis",
                 "INSECT", "Insect",
             ],
@@ -267,6 +267,23 @@ class ReportTypeConfig:
             "total_area_patterns": [],
             "levels": [],
             "field_name": "stand_count_analysis",
+        },
+        # ── Supplementary reports ────────────────────────────────────────
+        "rx_spraying": {
+            "keywords": ["RX - SPRAYING ZONE MANAGEMENT", "RX - SPRAYING", "RX_SPRAYING"],
+            "total_area_patterns": [],
+            "levels": [],
+            "field_name": "rx_spraying_analysis",
+        },
+        "zonation": {
+            "keywords": [
+                "ZONAL STATISTICS ZONE MANAGEMENT", 
+                "ESTADÍSTICAS ZONALES GESTIÓN DE ZONAS", 
+                "ESTADÍSTICAS ZONALES"
+            ],
+            "total_area_patterns": [],
+            "levels": [],
+            "field_name": "zonation_analysis",
         },
     }
 
@@ -431,6 +448,18 @@ class UnifiedReportExtractor:
                 "difference_type": None,
                 "difference_plants": None,
             },
+            "rx_spraying_analysis": {
+                "planned_date": None,
+                "pesticide_type": None,
+                "total_pesticide_amount": None,
+                "average_pesticide_amount": None,
+                "rates": [],
+            },
+            "zonation_analysis": {
+                "tile_size": None,
+                "num_zones": None,
+                "zones": [],
+            },
             "additional_info": None,
             "map_image": {
                 "source": None,
@@ -456,7 +485,7 @@ class UnifiedReportExtractor:
         filename_upper = os.path.basename(self.pdf_path).upper()
 
         # Check stand_count first — its keywords are the most distinctive
-        priority_order = ["stand_count", "plant_stress", "flowering", "pest", "waterlogging"]
+        priority_order = ["rx_spraying", "zonation", "stand_count", "plant_stress", "flowering", "pest", "waterlogging"]
 
         for type_key in priority_order:
             config = ReportTypeConfig.TYPES[type_key]
@@ -531,6 +560,12 @@ class UnifiedReportExtractor:
                 self.result["report"]["analysis_name"] = name
                 return
 
+        # Fallback: value before metadata labels (Analysis name is often above them)
+        m = re.search(r"([\w][\w\s.\-]{2,40}?)\s+(?:\d+\s+days?\s+)?Growing\s+stage\s*:", text_raw, re.I)
+        if m:
+            self.result["report"]["analysis_name"] = m.group(1).strip()
+            return
+
         # Fallback: use type keyword from the text
         if self.type_config:
             for kw in self.type_config["keywords"]:
@@ -582,7 +617,7 @@ class UnifiedReportExtractor:
         INVALID_STAGES = {
             "stress", "level", "table", "potential", "waterlogged", "wet", "zone",
             "plant", "pest", "waterlogging", "analysis", "detection", "health", "fine",
-            "flowering", "damage", "count",
+            "flowering", "damage", "count", "additional", "information",
         }
 
         def _valid_stage(s: str) -> bool:
@@ -598,9 +633,32 @@ class UnifiedReportExtractor:
             self.result["field"]["growing_stage"] = m.group(1).strip()
             return
 
+        # "76 days" or other numeric + unit stages
+        m = re.search(r"Growing\s+stage\s*:\s*(\d+\s+days?)\b", text, re.I)
+        if m:
+            self.result["field"]["growing_stage"] = m.group(1).strip()
+            return
+
         m = re.search(r"Growing\s+stage\s*:\s*([^\s]+(?:\s*-\s*[^\s]+)?)", text, re.I)
         if m:
             stage = m.group(1).strip().rstrip(".")
+            if _valid_stage(stage):
+                self.result["field"]["growing_stage"] = stage
+                return
+
+        # Fallback: value before label (happens in some layouts)
+        # Try specific patterns first: "76 days Growing stage:"
+        m = re.search(r"(\d+\s+days?)\s+Growing\s+stage\s*:", text, re.I)
+        if m:
+            self.result["field"]["growing_stage"] = m.group(1).strip()
+            return
+            
+        m = re.search(r"([\w\s.\-]+?)\s+Growing\s+stage\s*:", text, re.I)
+        if m:
+            stage = m.group(1).strip()
+            # If multiple words, take the last one (often the stage)
+            if " " in stage:
+                stage = stage.split()[-1]
             if _valid_stage(stage):
                 self.result["field"]["growing_stage"] = stage
                 return
@@ -784,6 +842,84 @@ class UnifiedReportExtractor:
 
         self.result["analysis"]["levels"] = levels
 
+    # ── Supplementary report specific extraction ─────────────────────────
+
+    def _extract_rx_spraying(self, text: str) -> None:
+        rx = self.result["rx_spraying_analysis"]
+        
+        # Planned date and Pesticide type
+        # Layout: Planned date [date] [type] Pesticide type
+        m = re.search(r"Planned\s+date\s+([\d/:-]+)\s+([\w\s.\-]+?)\s+Pesticide\s+type", text, re.I)
+        if m:
+            rx["planned_date"] = m.group(1).strip()
+            rx["pesticide_type"] = m.group(2).strip()
+        else:
+            # Fallbacks
+            m_date = re.search(r"Planned\s+date\s+([\d/:-]+)", text, re.I)
+            if m_date:
+                rx["planned_date"] = m_date.group(1).strip()
+            
+            m_type = re.search(r"([\w\s.\-]+?)\s+Pesticide\s+type", text, re.I)
+            if m_type:
+                rx["pesticide_type"] = m_type.group(1).strip()
+
+        # Total and Average pesticide
+        # Layout: Total pesticide amount [val] [unit] Average pesticide amount [val] [unit]
+        m = re.search(r"Total\s+pesticide\s+amount\s+([\d.]+)\s+([^\s]+)\s+Average\s+pesticide\s+amount\s+([\d.]+)\s+([^\s]+)", text, re.I)
+        if m:
+            rx["total_pesticide_amount"] = f"{m.group(1)} {m.group(2)}"
+            rx["average_pesticide_amount"] = f"{m.group(3)} {m.group(4)}"
+        else:
+            # Fallback for individual matches
+            m_total = re.search(r"Total\s+pesticide\s+amount\s+([\d.]+)\s+([^\s]+)", text, re.I)
+            if m_total:
+                rx["total_pesticide_amount"] = f"{m_total.group(1)} {m_total.group(2)}"
+            m_avg = re.search(r"Average\s+pesticide\s+amount\s+([\d.]+)\s+([^\s]+)", text, re.I)
+            if m_avg:
+                rx["average_pesticide_amount"] = f"{m_avg.group(1)} {m_avg.group(2)}"
+            
+        # Rate table (Zone Range Area % Rate)
+        rx["rates"] = []
+        for m in re.finditer(r"\b(\d+)\s+([\d.]+:[\d.]+)\s+([\d.]+)\s*(ha|ac(?:re)?s?|Hect(?:área|are)[\s\w]*?)\s+([\d.]+)%\s+([\d.]+)\s*([^\s]+)", text, re.I):
+            try:
+                rx["rates"].append({
+                    "color": int(m.group(1)),
+                    "zone_range": m.group(2),
+                    "area": float(m.group(3)),
+                    "area_unit": m.group(4).strip(),
+                    "percentage": float(m.group(5)),
+                    "rate": float(m.group(6)),
+                    "rate_unit": m.group(7).strip()
+                })
+            except ValueError:
+                pass
+
+    def _extract_zonation(self, text: str) -> None:
+        zn = self.result["zonation_analysis"]
+        
+        # Tile size and zones
+        m = re.search(r"(?:Tile\s+Size|Tamaño\s+de\s+la\s+Placa).*?(?:No\.\s+of\s+Zones|No\.\s+de\s+zonas)\s+(\d+)\s+([\d.]+m\s*[xX]\s*[\d.]+m)", text, re.I)
+        if m:
+            try:
+                zn["num_zones"] = int(m.group(1))
+                zn["tile_size"] = m.group(2).strip()
+            except ValueError:
+                pass
+
+        # Zones table (Zone Range Area %)
+        zn["zones"] = []
+        for m in re.finditer(r"\b(\d+)\s+([\d.]+:[\d.]+)\s+([\d.]+)\s*(ha|ac(?:re)?s?|Hect(?:área|are)[\s\w]*?)\s+([\d.]+)%", text, re.I):
+            try:
+                zn["zones"].append({
+                    "color": int(m.group(1)),
+                    "zone_range": m.group(2),
+                    "area": float(m.group(3)),
+                    "area_unit": m.group(4).strip(),
+                    "percentage": float(m.group(5))
+                })
+            except ValueError:
+                pass
+
     # ── Stand Count specific extraction ──────────────────────────────────
 
     def _extract_stand_count(self, text: str) -> None:
@@ -884,7 +1020,11 @@ class UnifiedReportExtractor:
         s = raw.strip()
         if "Test comment" in s:
             return "Test comment"
+        # Filter out placeholder/template text
+        if re.match(r"^\(?or\s+recommendation\)?$", s, re.I):
+            return None
         s = re.sub(r"^\)\s*", "", s)
+        s = re.sub(r"^\(or\s+recommendation\)\s*", "", s, flags=re.I).strip()
         s = re.sub(r"^Analysis\s+name\s*:\s*[^\n]+(?=\s|$)", "", s, flags=re.I).strip()
         s = re.sub(r"\s+Powered\s+by\s*:?\s*.*$", "", s, flags=re.I).strip()
         s = re.sub(r"\s+STRESS\s+LEVEL\s+TABLE\s*.*$", "", s, flags=re.I).strip()
@@ -892,7 +1032,7 @@ class UnifiedReportExtractor:
 
     def _extract_additional_info(self, full_text: str, text_spaced: str) -> None:
         patterns = [
-            r"Additional\s+[Ii]nformation\s*(?:\([^)]*\))?\s*:\s*(.+?)(?=\s+Powered\s+by|$)",
+            r"Additional\s+[Ii]nformation\s*(?:\([^)]*\))?\s*:\s*(.+?)(?=\s+(?:Powered\s+by|Analysis\s+name|STRESS\s+LEVEL\s+TABLE)|$)",
             r"Additional\s+[Ii]nformation\s*(?:\([^)]*\))?\s*:?\s*(.+?)(?:\s+Powered|$)",
             r"Recommendation\s*:\s*([^\n]+)",
             r"Note\s*:\s*([^\n]+)",
@@ -1076,6 +1216,10 @@ class UnifiedReportExtractor:
         # Type-specific extraction
         if self.report_type == "stand_count":
             self._extract_stand_count(full_text_spaced)
+        elif self.report_type == "rx_spraying":
+            self._extract_rx_spraying(full_text_spaced)
+        elif self.report_type == "zonation":
+            self._extract_zonation(full_text_spaced)
         else:
             # Agremo-style: extract levels and total area
             self._extract_total_area(lower_spaced, full_text_spaced)
