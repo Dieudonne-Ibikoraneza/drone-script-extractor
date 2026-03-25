@@ -565,13 +565,15 @@ class UnifiedReportExtractor:
         m = re.search(r"([^\n]{2,40}?)\s+(?:\d+\s+days?\s+)?Growing\s+stage\s*:", text_raw, re.I)
         if m:
             name = m.group(1).strip()
-            if "ZONE MANAGEMENT" not in name.upper():
+            # Ensure it doesn't accidentally capture other metadata labels
+            if "ZONE MANAGEMENT" not in name.upper() and not re.search(r"\b(?:Crop|Field\s+area|Analysis\s+name)\b", name, re.I):
                 self.result["report"]["analysis_name"] = name
                 return
 
         # Fallback: use type keyword if we found one
         if self.report_type:
             self.result["report"]["analysis_name"] = self.report_type.replace("_", " ").title()
+            return
             
         # Fallback: use type keyword from the text
         if self.type_config:
