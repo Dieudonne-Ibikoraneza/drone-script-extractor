@@ -15,3 +15,4 @@ cloudinary
 # OCR (optional — needed for browser-printed PDFs)
 pytesseract
 Pillow
+pdf2image

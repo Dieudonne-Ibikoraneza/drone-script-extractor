@@ -38,8 +38,29 @@ try:
     import pytesseract
     from PIL import Image as _PILImage
     _OCR_AVAILABLE = True
+    
+    # Windows Tesseract detection
+    if os.name == 'nt':
+        _TESS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.exists(_TESS_PATH):
+            # Set both to be safe
+            pytesseract.pytesseract.tesseract_cmd = str(_TESS_PATH)
+            if hasattr(pytesseract, 'tesseract_cmd'):
+                pytesseract.tesseract_cmd = str(_TESS_PATH)
+            logging.info(f"Using Tesseract at: {_TESS_PATH}")
+        else:
+            logging.warning(f"Tesseract not found at default path: {_TESS_PATH}")
 except ImportError:
     _OCR_AVAILABLE = False
+except Exception as e:
+    logging.warning(f"Error initializing Tesseract: {e}")
+    _OCR_AVAILABLE = False
+
+try:
+    from pdf2image import convert_from_path
+    _PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    _PDF2IMAGE_AVAILABLE = False
 
 # Cloudinary init
 if settings.cloudinary_cloud_name and settings.cloudinary_api_key and settings.cloudinary_api_secret:
@@ -216,14 +237,16 @@ class ReportTypeConfig:
                 {
                     "name": "Potential Pest Stress",
                     "severity": "moderate",
-                    "pattern_pct_first":  r"\bPotential\s+Pest\s+Stress\s+([\d.]+)\s*%\s+([\d.]+)\b",
-                    "pattern_area_first": r"\bPotential\s+Pest\s+Stress\s+([\d.]+)\s+([\d.]+)\s*%",
+                    "pattern_pct_first":  r"\bPotential\s+Pest(?:\s+Stress)?\s+([\d.]+)\s*%\s+([\d.]+)\b",
+                    "pattern_area_first": r"\bPotential\s+Pest(?:\s+Stress)?\s+([\d.]+)\s+([\d.]+)\s*%",
+                    "pattern_any": r"\bPotential\s+Pest.*?\b([\d.]+)\s*%.*?\b([\d.]+)\b", # New permissive pattern
                 },
                 {
                     "name": "Pest Stress",
                     "severity": "high",
-                    "pattern_pct_first":  r"(?<!Potential )\bPest\s+Stress\s+([\d.]+)\s*%\s+([\d.]+)\b",
-                    "pattern_area_first": r"(?<!Potential )\bPest\s+Stress\s+([\d.]+)\s+([\d.]+)\s*%",
+                    "pattern_pct_first":  r"(?<!Potential )\bPest(?:\s+Stress)?\s+([\d.]+)\s*%\s+([\d.]+)\b",
+                    "pattern_area_first": r"(?<!Potential )\bPest(?:\s+Stress)?\s+([\d.]+)\s+([\d.]+)\s*%",
+                    "pattern_any": r"(?<!Potential )\bPest.*?\b([\d.]+)\s*%.*?\b([\d.]+)\b", # New permissive pattern
                 },
                 {
                     "name": "No Damage",
@@ -301,23 +324,44 @@ def _is_acres(text: str) -> bool:
 
 
 def _ocr_page(pdf_path: str, page_num: int) -> str:
-    """OCR a page using pdfplumber rendering + tesseract."""
-    if not (_OCR_AVAILABLE and _PDFPLUMBER_AVAILABLE):
-        logger.warning("pytesseract or pdfplumber not available — cannot OCR")
+    """OCR a page using high-resolution rendering (preferring pdf2image/poppler)."""
+    if not _OCR_AVAILABLE:
+        logger.warning("pytesseract not available — cannot OCR")
         return ""
+        
     try:
-        import pdfplumber
-        with pdfplumber.open(pdf_path) as pdf:
-            if page_num >= len(pdf.pages):
-                return ""
-            page = pdf.pages[page_num]
-            img = page.to_image(resolution=200)
-            text = pytesseract.image_to_string(img.original, config="--psm 6")
-            logger.info(f"OCR page {page_num}: recovered {len(text)} chars")
-            return text
+        # Strategy A: pdf2image (best quality, requires Poppler)
+        if _PDF2IMAGE_AVAILABLE:
+            try:
+                images = convert_from_path(
+                    pdf_path, 
+                    first_page=page_num + 1, 
+                    last_page=page_num + 1, 
+                    dpi=300
+                )
+                if images:
+                    img = images[0]
+                    text = pytesseract.image_to_string(img, config="--psm 6")
+                    logger.info(f"OCR page {page_num} (pdf2image): recovered {len(text)} chars")
+                    return text
+            except Exception as e:
+                logger.debug(f"pdf2image failed, falling back to pdfplumber: {e}")
+
+        # Strategy B: pdfplumber fallback
+        if _PDFPLUMBER_AVAILABLE:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                if page_num < len(pdf.pages):
+                    page = pdf.pages[page_num]
+                    img = page.to_image(resolution=300) # Increased resolution
+                    text = pytesseract.image_to_string(img.original, config="--psm 6")
+                    logger.info(f"OCR page {page_num} (pdfplumber): recovered {len(text)} chars")
+                    return text
+                    
     except Exception as e:
         logger.warning(f"OCR failed on page {page_num}: {e}")
-        return ""
+        
+    return ""
 
 
 def _build_text_from_page(
@@ -598,6 +642,9 @@ class UnifiedReportExtractor:
                 "flowering", "count",
             }
             if crop and not any(w in excluded for w in crop.lower().split()) and len(crop) >= 2:
+                # Normalization
+                if crop.lower() == "maiz":
+                    crop = "Maize"
                 self.result["field"]["crop"] = crop
                 return
 
@@ -835,6 +882,18 @@ class UnifiedReportExtractor:
             if result is None and "pattern_area_first" in lc:
                 result = self._try_level_match(lc["pattern_area_first"], text, 2, 1)
 
+            if result is None and "pattern_any" in lc:
+                result = self._try_level_match(lc["pattern_any"], text, 1, 2)
+
+            if result is None:
+                # Spanish fallbacks
+                if name == "Fine":
+                    result = self._try_level_match(r"\bFine\s+([\d.]+)\s*%\s+([\d.]+)\b", text, 1, 2)
+                elif "Potential" in name:
+                    result = self._try_level_match(r"\bPotencial\s+Plaga\s+([\d.]+)\s*%\s+([\d.]+)\b", text, 1, 2)
+                elif "Pest" in name:
+                    result = self._try_level_match(r"\bPlaga\s+([\d.]+)\s*%\s+([\d.]+)\b", text, 1, 2)
+            
             if result is None:
                 continue
 
@@ -1156,39 +1215,44 @@ class UnifiedReportExtractor:
         width = height = None
         source = "unknown"
 
-        if image_list:
-            images_data = []
-            for img in image_list:
-                xref = img[0]
-                try:
-                    base_image = self.doc.extract_image(xref)
-                    data = base_image["image"]
-                    images_data.append({
-                        "bytes": data,
-                        "format": base_image["ext"],
-                        "size": len(data),
-                        "width": base_image.get("width", 0),
-                        "height": base_image.get("height", 0),
-                    })
-                except Exception as e:
-                    logger.warning(f"Could not extract image xref {xref}: {e}")
-            if images_data:
-                largest = max(images_data, key=lambda x: x["size"])
-                image_bytes = largest["bytes"]
-                img_format = largest["format"] or "png"
-                width, height = largest["width"], largest["height"]
-                source = "embedded"
+        # For Agremo reports, we typically want a high-res RENDERED and CROPPED page
+        # rather than an embedded image, because browser-printed PDFs often
+        # embed the whole page as a single image, bypassing our crop.
+        pass
 
         if not image_bytes:
-            zoom = 150 / 72
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            image_bytes = pix.tobytes("png")
-            width, height = pix.width, pix.height
-            source = "page_render"
-            img_format = "png"
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                pix.save(os.path.join(output_dir, "field_map.png"))
+            logger.info("Strategy: Rendering page for map image")
+            # Render page with high DPI for clarity
+            zoom = 300 / 72  # 300 DPI
+            
+            # Smart Crop for Agremo Reports (Remove headers, footers, and scale bars)
+            # We calculate coordinates based on the original 72 DPI page size
+            page_rect = page.rect
+            y0 = page_rect.height * 0.11
+            y1 = page_rect.height * 0.82
+            clip_rect = fitz.Rect(0, y0, page_rect.width, y1)
+            
+            logger.info(f"Rendering map image with clip: {clip_rect} at zoom {zoom}")
+            
+            try:
+                # The most reliable way to crop and render in one go
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip_rect)
+                
+                image_bytes = pix.tobytes("png")
+                width, height = pix.width, pix.height
+                source = "page_render_cropped"
+                img_format = "png"
+                
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    pix.save(os.path.join(output_dir, "field_map_cropped.png"))
+            except Exception as e:
+                logger.warning(f"Cropped rendering failed, using full page: {e}")
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                image_bytes = pix.tobytes("png")
+                width, height = pix.width, pix.height
+                source = "page_render_full"
+                img_format = "png"
 
         if not image_bytes:
             return {"error": "Could not extract or render map image"}
