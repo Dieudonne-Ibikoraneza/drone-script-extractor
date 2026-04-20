@@ -1090,14 +1090,38 @@ class UnifiedReportExtractor:
         s = raw.strip()
         if "Test comment" in s:
             return "Test comment"
+        
         # Filter out placeholder/template text
         if re.match(r"^\(?or\s+recommendation\)?$", s, re.I):
             return None
+            
+        # Removal of OCR artifacts/footer noise
         s = re.sub(r"^\)\s*", "", s)
         s = re.sub(r"^\(or\s+recommendation\)\s*", "", s, flags=re.I).strip()
+        s = re.sub(r"^[!|@\s]{1,}\s*", "", s) # Leading symbols
+        
+        # Removal of platform boilerplate (Agremo, Starhawk, etc.)
+        # Ensure we catch these even if they are at the start of the fragment or the whole thing
+        boilerplate_patterns = [
+            r"(?:\s|\||^)(?:agremo|pon appag|powered by|starhawk|appag|analysis name).*$",
+            r"^Powered\s*by\s*:?\s*.*$",
+            r"^Agremo\s*.*$",
+        ]
+        for pat in boilerplate_patterns:
+            s = re.sub(pat, "", s, flags=re.I).strip()
+            
+        s = re.sub(r"\s+[!|@]\s*", " ", s).strip() # Middle symbols
         s = re.sub(r"^Analysis\s+name\s*:\s*[^\n]+(?=\s|$)", "", s, flags=re.I).strip()
-        s = re.sub(r"\s+Powered\s+by\s*:?\s*.*$", "", s, flags=re.I).strip()
         s = re.sub(r"\s+STRESS\s+LEVEL\s+TABLE\s*.*$", "", s, flags=re.I).strip()
+        
+        # Final safety checks
+        if not re.search(r"[a-zA-Z0-9]", s):
+            return None
+            
+        # If the string is just "Powered" or "Powered by" after cleanup, it's trash
+        if s.lower() in ("powered", "powered by", "agremo", "starhawk"):
+            return None
+            
         return s if 2 <= len(s) <= 400 else None
 
     def _extract_additional_info(self, full_text: str, text_spaced: str) -> None:
@@ -1143,23 +1167,50 @@ class UnifiedReportExtractor:
     # ── Totals fallback ──────────────────────────────────────────────────
 
     def _calculate_total_from_levels(self) -> None:
-        """Calculate total area from levels, excluding healthy/none/low severity."""
+        """
+        Calculate total area from levels, excluding healthy/none/low severity.
+        Also performs sanity checks against extracted 'Total Area' labels.
+        """
         HA_TO_ACRES = 1 / ACRES_TO_HA
         levels = self.result["analysis"]["levels"]
+        field_ha = self.result["field"]["area_hectares"]
+        
         if not levels:
             return
+            
         # Only sum "affected" levels — exclude healthy/none/low
         affected = [l for l in levels if l["severity"] not in ("healthy", "none", "low")]
-        if self.result["analysis"]["total_area_hectares"] is None and affected:
-            total = sum(l["area_hectares"] for l in affected)
-            if total > 0:
-                self.result["analysis"]["total_area_hectares"] = round(total, 4)
-                self.result["analysis"]["total_area_acres"] = round(total * HA_TO_ACRES, 4)
-        if self._uses_acres and self.result["analysis"]["total_area_acres"] is None and affected:
-            total_ac = sum(l.get("area_acres", 0) for l in affected)
-            if total_ac > 0:
-                self.result["analysis"]["total_area_acres"] = round(total_ac, 4)
-                self.result["analysis"]["total_area_hectares"] = round(total_ac * ACRES_TO_HA, 4)
+        level_sum_ha = sum(l["area_hectares"] for l in affected)
+        level_sum_pct = sum(l["percentage"] for l in affected)
+        
+        # Sanity Check A: Check if extracted total_area_hectares is realistic
+        current_total_ha = self.result["analysis"]["total_area_hectares"]
+        if current_total_ha is not None:
+            # If extracted value exceeds field area, it's almost certainly a false positive (e.g. part of a date or ID)
+            if field_ha and current_total_ha > field_ha * 1.05: # 5% margin for rounding
+                logger.warning(f"Extracted total area ({current_total_ha} ha) exceeds field area ({field_ha} ha). Discarding.")
+                current_total_ha = None
+            # If extracted value significantly differs from sum of levels, prefer level sum
+            elif level_sum_ha > 0 and abs(current_total_ha - level_sum_ha) / level_sum_ha > 0.5:
+                logger.warning(f"Extracted total area ({current_total_ha} ha) inconsistent with sum of levels ({level_sum_ha} ha). Discarding.")
+                current_total_ha = None
+
+        # Populate if missing or discarded
+        if current_total_ha is None and level_sum_ha > 0:
+            self.result["analysis"]["total_area_hectares"] = round(level_sum_ha, 4)
+            self.result["analysis"]["total_area_acres"] = round(level_sum_ha * HA_TO_ACRES, 4)
+            
+        # Ensure percent is also consistent
+        if self.result["analysis"]["total_area_percent"] is None and level_sum_pct > 0:
+            self.result["analysis"]["total_area_percent"] = round(level_sum_pct, 2)
+            
+        # Final safety cap: never exceed field area
+        if field_ha and self.result["analysis"]["total_area_hectares"]:
+            if self.result["analysis"]["total_area_hectares"] > field_ha:
+                self.result["analysis"]["total_area_hectares"] = field_ha
+                self.result["analysis"]["total_area_acres"] = round(field_ha * HA_TO_ACRES, 4)
+                self.result["analysis"]["total_area_percent"] = 100.0
+
         # Ensure both units exist if one is set
         if self.result["analysis"]["total_area_hectares"] and not self.result["analysis"]["total_area_acres"]:
             self.result["analysis"]["total_area_acres"] = round(
@@ -1169,10 +1220,6 @@ class UnifiedReportExtractor:
             self.result["analysis"]["total_area_hectares"] = round(
                 self.result["analysis"]["total_area_acres"] * ACRES_TO_HA, 4
             )
-        if self.result["analysis"]["total_area_percent"] is None and affected:
-            pct = sum(l["percentage"] for l in affected)
-            if pct > 0:
-                self.result["analysis"]["total_area_percent"] = round(pct, 2)
 
     # ── Map image extraction + Cloudinary upload ─────────────────────────
 
